@@ -1,12 +1,15 @@
 "use client";
 import { useState } from "react";
-import { ScheduleData, stroopsToXlm, truncate, vestingProgress, formatDate, claimVested, revokeSchedule } from "@/lib/stellar";
+import Link from "next/link";
+import { ScheduleData, stroopsToXlm, truncate, vestingProgress, formatDate, claimVested, revokeSchedule, parseContractError } from "@/lib/stellar";
 import { useWallet } from "@/lib/WalletContext";
+import VestingChart from "@/components/VestingChart";
 
 export default function ScheduleCard({ schedule, onAction }: { schedule: ScheduleData; onAction: () => void }) {
   const { publicKey } = useWallet();
   const [loading, setLoading] = useState<"claim" | "revoke" | null>(null);
   const [err, setErr] = useState("");
+  const [showChart, setShowChart] = useState(false);
 
   const now = Math.floor(Date.now() / 1000);
   const progress = vestingProgress(schedule, now);
@@ -19,7 +22,7 @@ export default function ScheduleCard({ schedule, onAction }: { schedule: Schedul
     if (!publicKey) return;
     setLoading("claim"); setErr("");
     try { await claimVested(publicKey, schedule.id); onAction(); }
-    catch (e: any) { setErr(e.message); }
+    catch (e: any) { setErr(parseContractError(e)); }
     finally { setLoading(null); }
   };
 
@@ -27,7 +30,7 @@ export default function ScheduleCard({ schedule, onAction }: { schedule: Schedul
     if (!publicKey) return;
     setLoading("revoke"); setErr("");
     try { await revokeSchedule(publicKey, schedule.id); onAction(); }
-    catch (e: any) { setErr(e.message); }
+    catch (e: any) { setErr(parseContractError(e)); }
     finally { setLoading(null); }
   };
 
@@ -43,7 +46,9 @@ export default function ScheduleCard({ schedule, onAction }: { schedule: Schedul
     <div className="card p-5 flex flex-col gap-3">
       <div className="flex items-start justify-between">
         <div>
-          <p className="text-sm font-semibold text-white">Schedule #{schedule.id}</p>
+          <Link href={`/app/schedule/${schedule.id}`} className="text-sm font-semibold text-white hover:text-violet-300 transition-colors">
+            Schedule #{schedule.id}
+          </Link>
           <p className="text-xs text-zinc-500 mt-0.5">{schedule.kind} vesting{schedule.revocable ? " · revocable" : ""}</p>
         </div>
         <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${statusColor}`}>{statusLabel}</span>
@@ -65,6 +70,20 @@ export default function ScheduleCard({ schedule, onAction }: { schedule: Schedul
         <div className="h-1.5 rounded-full bg-white/5 overflow-hidden">
           <div className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-500 transition-all" style={{ width: `${progress}%` }} />
         </div>
+      </div>
+
+      <div>
+        <button
+          onClick={() => setShowChart(v => !v)}
+          className="text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+        >
+          {showChart ? "Hide chart ▲" : "Show chart ▼"}
+        </button>
+        {showChart && (
+          <div className="mt-2">
+            <VestingChart schedule={schedule} />
+          </div>
+        )}
       </div>
 
       {err && <p className="text-xs text-red-400">{err}</p>}

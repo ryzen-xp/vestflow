@@ -213,3 +213,18 @@ export function formatDate(ts: number): string {
     year: "numeric", month: "short", day: "numeric",
   });
 }
+
+export function parseContractError(e: Error): string {
+  const msg = e.message;
+  if (msg.includes("Nothing to claim yet")) return "No tokens are available to claim yet.";
+  if (msg.includes("Schedule is not revocable")) return "This schedule cannot be revoked.";
+  if (msg.includes("Already revoked")) return "This schedule has already been revoked.";
+  if (msg.includes("Not the grantor")) return "Only the grantor can perform this action.";
+  if (msg.includes("Not the beneficiary")) return "Only the beneficiary can claim tokens.";
+  if (msg.includes("Schedule not found")) return "Schedule not found.";
+  if (msg.includes("Insufficient balance")) return "Insufficient balance to complete this action.";
+  if (msg.includes("Schedule has ended")) return "This vesting schedule has already ended.";
+  if (msg.includes("Start time in the past")) return "The start time must be in the future.";
+  if (msg.includes("Duration too short")) return "The vesting duration is too short.";
+  return msg;
+}

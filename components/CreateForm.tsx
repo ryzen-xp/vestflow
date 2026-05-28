@@ -1,6 +1,6 @@
 "use client";
 import { useState } from "react";
-import { createSchedule, CONTRACT_ID } from "@/lib/stellar";
+import { createSchedule, CONTRACT_ID, parseContractError } from "@/lib/stellar";
 import { useWallet } from "@/lib/WalletContext";
 
 export default function CreateForm() {
@@ -27,7 +27,7 @@ export default function CreateForm() {
         form.kind, form.revocable,
       );
       setTxHash(hash); setStatus("done");
-    } catch (e: any) { setErrMsg(e.message); setStatus("error"); }
+    } catch (e: any) { setErrMsg(parseContractError(e)); setStatus("error"); }
   };
 
   if (!publicKey) return (
