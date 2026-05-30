@@ -5,6 +5,7 @@ import { useWallet } from "@/lib/WalletContext";
 
 export default function CreateForm() {
   const { publicKey } = useWallet();
+  const [step, setStep] = useState<"form" | "confirm">("form");
   const [form, setForm] = useState({
     beneficiary: "", amount: "", startDate: "", startTime: "00:00", durationDays: "",
     cliffDays: "0", kind: "Linear" as "Linear" | "Cliff", revocable: true,
@@ -15,8 +16,12 @@ export default function CreateForm() {
 
   const set = (k: string, v: any) => setForm((f) => ({ ...f, [k]: v }));
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleShowConfirm = (e: React.FormEvent) => {
     e.preventDefault();
+    setStep("confirm");
+  };
+
+  const handleConfirmSign = async () => {
     if (!publicKey) return;
     setStatus("loading"); setErrMsg("");
     try {
@@ -25,14 +30,18 @@ export default function CreateForm() {
       const startDateTime = new Date(form.startDate);
       startDateTime.setHours(hours, minutes, 0, 0);
       const startTs = Math.floor(startDateTime.getTime() / 1000);
-      
+
       const hash = await createSchedule(
         publicKey, form.beneficiary, parseFloat(form.amount),
         startTs, parseInt(form.durationDays), parseInt(form.cliffDays),
         form.kind, form.revocable,
       );
       setTxHash(hash); setStatus("done");
-    } catch (e: any) { setErrMsg(parseContractError(e)); setStatus("error"); }
+    } catch (e: any) {
+      setErrMsg(parseContractError(e));
+      setStatus("error");
+      setStep("form"); // Go back to form on error so they can fix it
+    }
   };
 
   if (!publicKey) return (
@@ -49,12 +58,58 @@ export default function CreateForm() {
       <p className="text-zinc-400 text-sm">Tokens are now locked and vesting has started.</p>
       <a href={`https://stellar.expert/explorer/testnet/tx/${txHash}`} target="_blank" rel="noopener noreferrer"
         className="text-xs font-mono text-violet-400 hover:underline break-all">{txHash}</a>
-      <button onClick={() => { setStatus("idle"); setTxHash(""); }} className="mt-2 text-violet-400 text-sm hover:underline">Create another</button>
+      <button onClick={() => { setStatus("idle"); setStep("form"); setTxHash(""); }} className="mt-2 text-violet-400 text-sm hover:underline">Create another</button>
     </div>
   );
 
+  if (step === "confirm") {
+    return (
+      <div className="card p-6 flex flex-col gap-6">
+        <div className="flex flex-col gap-2">
+          <h2 className="text-lg font-semibold">Confirm Vesting Schedule</h2>
+          <p className="text-sm text-zinc-400">Review the details below before signing the transaction.</p>
+        </div>
+
+        <div className="flex flex-col gap-4 bg-zinc-900/50 rounded-xl p-4 border border-zinc-800">
+          <SummaryItem label="Beneficiary" value={form.beneficiary} full />
+          <div className="grid grid-cols-2 gap-4">
+            <SummaryItem label="Amount" value={`${form.amount} XLM`} />
+            <SummaryItem label="Vesting Type" value={form.kind} />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <SummaryItem label="Start Date" value={`${form.startDate} ${form.startTime}`} />
+            <SummaryItem label="Duration" value={`${form.durationDays} days`} />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <SummaryItem label="Cliff" value={form.kind === "Cliff" ? `${form.cliffDays} days` : "None"} />
+            <SummaryItem label="Revocable" value={form.revocable ? "Yes" : "No"} />
+          </div>
+        </div>
+
+        {status === "error" && <p className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">{errMsg}</p>}
+
+        <div className="flex flex-col gap-3">
+          <button
+            onClick={handleConfirmSign}
+            disabled={status === "loading"}
+            className="btn-primary rounded-xl py-3 font-semibold text-white disabled:opacity-60"
+          >
+            {status === "loading" ? "Waiting for signature…" : "Confirm & Sign"}
+          </button>
+          <button
+            onClick={() => setStep("form")}
+            disabled={status === "loading"}
+            className="text-sm text-zinc-400 hover:text-white transition-colors"
+          >
+            ← Back to Edit
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <form onSubmit={handleSubmit} className="card p-6 flex flex-col gap-5">
+    <form onSubmit={handleShowConfirm} className="card p-6 flex flex-col gap-5">
       <h2 className="text-lg font-semibold">New Vesting Schedule</h2>
 
       <Field label="Beneficiary Address">
@@ -106,11 +161,20 @@ export default function CreateForm() {
       {status === "error" && <p className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">{errMsg}</p>}
 
       <button type="submit" disabled={status === "loading"} className="btn-primary rounded-xl py-3 font-semibold text-white disabled:opacity-60">
-        {status === "loading" ? "Waiting for signature…" : "Lock & Create Schedule"}
+        Review & Create
       </button>
 
       {!CONTRACT_ID && <p className="text-xs text-yellow-400 text-center">Set NEXT_PUBLIC_CONTRACT_ID in .env.local</p>}
     </form>
+  );
+}
+
+function SummaryItem({ label, value, full }: { label: string; value: string; full?: boolean }) {
+  return (
+    <div className={`flex flex-col gap-1 ${full ? "col-span-2" : ""}`}>
+      <span className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">{label}</span>
+      <span className={`text-sm ${full ? "font-mono break-all" : "font-medium"} text-zinc-200`}>{value}</span>
+    </div>
   );
 }
 
