@@ -1,4 +1,4 @@
-#![no_std]
+conti#![no_std]
 #![allow(clippy::too_many_arguments)]
 
 //! # VestFlow Contract
@@ -62,6 +62,12 @@ pub enum DataKey {
     GrantorSchedules(Address),
     /// Index of schedule IDs where an address is the beneficiary.
     BeneficiarySchedules(Address),
+    /// NFT token contract address for vesting receipts.
+    NftContract,
+    /// Performance milestone attestations for a schedule.
+    PerformanceMilestones(u64),
+    /// Oracle address authorized to attest milestones.
+    PerformanceOracle,
 }
 
 /// Mandatory delay between an on-chain upgrade announcement and execution.
@@ -152,6 +158,26 @@ pub struct VestingSchedule {
     /// Zero for non-revoked schedules. Used so the beneficiary can still
     /// claim already-vested tokens after a revocation.
     pub vested_at_revoke: i128,
+    /// Whether this schedule is currently paused.
+    pub paused: bool,
+    /// Cumulative time (in seconds) the schedule has been paused.
+    pub paused_duration: u64,
+    /// Timestamp when the schedule was last paused (0 if not paused).
+    pub paused_at: u64,
+    /// Whether performance milestones are required for this schedule.
+    pub requires_milestones: bool,
+}
+
+/// Performance milestone attestation for gating vesting releases.
+#[contracttype]
+#[derive(Clone)]
+pub struct PerformanceMilestone {
+    /// Percentage of total vesting unlocked by this milestone (0-100).
+    pub unlock_percentage: u32,
+    /// Whether the milestone has been attested by the oracle.
+    pub attested: bool,
+    /// Timestamp when the milestone was attested.
+    pub attested_at: u64,
     /// Milestone tranches for `VestingKind::Graded` schedules.
     /// Empty for all other kinds.
     pub milestones: Vec<GradedMilestone>,
@@ -172,7 +198,18 @@ impl VestingSchedule {
         if now < self.start_time {
             return 0;
         }
-        let elapsed = now - self.start_time;
+        
+        // Calculate effective elapsed time accounting for pauses
+        let mut elapsed = now - self.start_time;
+        
+        // Subtract paused duration
+        elapsed = elapsed.saturating_sub(self.paused_duration);
+        
+        // If currently paused, subtract additional time since pause started
+        if self.paused && self.paused_at > 0 {
+            let current_pause_duration = now.saturating_sub(self.paused_at);
+            elapsed = elapsed.saturating_sub(current_pause_duration);
+        }
         match self.kind {
             VestingKind::Cliff => {
                 if elapsed >= self.cliff_duration {
@@ -473,6 +510,10 @@ impl VestFlowContract {
             revocable,
             revoked: false,
             vested_at_revoke: 0,
+            paused: false,
+            paused_duration: 0,
+            paused_at: 0,
+            requires_milestones: false,
             milestones: vec![&env],
         };
 
@@ -614,6 +655,227 @@ impl VestFlowContract {
         id
     }
 
+    /// Pause an active vesting schedule (grantor only).
+    ///
+    /// While paused, no additional tokens vest. The beneficiary can still claim
+    /// already-vested tokens. The grantor can resume the schedule later.
+    ///
+    /// # Errors
+    ///
+    /// Panics with `"Schedule not found"` if `schedule_id` does not exist.
+    /// Panics with `"Not the grantor"` if caller is not the grantor.
+    /// Panics with `"Schedule already paused"` if already paused.
+    /// Panics with `"Cannot pause revoked schedule"` if schedule is revoked.
+    pub fn pause_schedule(env: Env, schedule_id: u64) {
+        let mut schedule: VestingSchedule = env
+            .storage()
+            .instance()
+            .get(&DataKey::Schedule(schedule_id))
+            .expect("Schedule not found");
+
+        schedule.grantor.require_auth();
+        assert!(!schedule.paused, "Schedule already paused");
+        assert!(!schedule.revoked, "Cannot pause revoked schedule");
+
+        schedule.paused = true;
+        schedule.paused_at = env.ledger().timestamp();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Schedule(schedule_id), &schedule);
+        env.events().publish(
+            (symbol_short!("paused"), schedule.grantor.clone()),
+            schedule_id,
+        );
+    }
+
+    /// Resume a paused vesting schedule (grantor only).
+    ///
+    /// Accumulates the paused duration and resumes vesting from the current time.
+    ///
+    /// # Errors
+    ///
+    /// Panics with `"Schedule not found"` if `schedule_id` does not exist.
+    /// Panics with `"Not the grantor"` if caller is not the grantor.
+    /// Panics with `"Schedule not paused"` if not currently paused.
+    pub fn resume_schedule(env: Env, schedule_id: u64) {
+        let mut schedule: VestingSchedule = env
+            .storage()
+            .instance()
+            .get(&DataKey::Schedule(schedule_id))
+            .expect("Schedule not found");
+
+        schedule.grantor.require_auth();
+        assert!(schedule.paused, "Schedule not paused");
+
+        let now = env.ledger().timestamp();
+        let pause_duration = now.saturating_sub(schedule.paused_at);
+        schedule.paused_duration += pause_duration;
+        schedule.paused = false;
+        schedule.paused_at = 0;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Schedule(schedule_id), &schedule);
+        env.events().publish(
+            (symbol_short!("resumed"), schedule.grantor.clone()),
+            (schedule_id, pause_duration),
+        );
+    }
+
+    /// Initialize the oracle address authorized to attest performance milestones.
+    ///
+    /// Can only be called once by the upgrade authority.
+    ///
+    /// # Errors
+    ///
+    /// Panics with `"Oracle already initialized"` if called again.
+    pub fn initialize_performance_oracle(env: Env, oracle: Address) {
+        let authority = Self::read_upgrade_authority(&env);
+        authority.require_auth();
+
+        assert!(
+            !env.storage().instance().has(&DataKey::PerformanceOracle),
+            "Oracle already initialized"
+        );
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PerformanceOracle, &oracle);
+        env.events()
+            .publish((symbol_short!("orc_init"), oracle), ());
+    }
+
+    /// Get the configured performance oracle address.
+    pub fn performance_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PerformanceOracle)
+    }
+
+    /// Enable performance-based vesting for a schedule (grantor only).
+    ///
+    /// Once enabled, the beneficiary can only claim tokens after the oracle
+    /// attests the required milestones.
+    ///
+    /// # Errors
+    ///
+    /// Panics with `"Schedule not found"` if `schedule_id` does not exist.
+    /// Panics with `"Not the grantor"` if caller is not the grantor.
+    /// Panics with `"Milestones already enabled"` if already enabled.
+    pub fn enable_performance_milestones(env: Env, schedule_id: u64, milestones: Vec<u32>) {
+        let mut schedule: VestingSchedule = env
+            .storage()
+            .instance()
+            .get(&DataKey::Schedule(schedule_id))
+            .expect("Schedule not found");
+
+        schedule.grantor.require_auth();
+        assert!(!schedule.requires_milestones, "Milestones already enabled");
+
+        schedule.requires_milestones = true;
+
+        // Initialize milestone data
+        let mut milestone_data: Vec<PerformanceMilestone> = vec![&env];
+        for percentage in milestones.iter() {
+            milestone_data.push_back(PerformanceMilestone {
+                unlock_percentage: percentage,
+                attested: false,
+                attested_at: 0,
+            });
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Schedule(schedule_id), &schedule);
+        env.storage()
+            .instance()
+            .set(&DataKey::PerformanceMilestones(schedule_id), &milestone_data);
+
+        env.events().publish(
+            (symbol_short!("mile_en"), schedule.grantor.clone()),
+            schedule_id,
+        );
+    }
+
+    /// Attest a performance milestone (oracle only).
+    ///
+    /// # Errors
+    ///
+    /// Panics with `"Oracle not initialized"` if oracle is not configured.
+    /// Panics with `"Not the oracle"` if caller is not the oracle.
+    /// Panics with `"Milestone index out of bounds"` if invalid index.
+    /// Panics with `"Milestone already attested"` if already attested.
+    pub fn attest_milestone(env: Env, schedule_id: u64, milestone_index: u32) {
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PerformanceOracle)
+            .expect("Oracle not initialized");
+
+        oracle.require_auth();
+
+        let mut milestones: Vec<PerformanceMilestone> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PerformanceMilestones(schedule_id))
+            .expect("Schedule has no milestones");
+
+        assert!(
+            (milestone_index as usize) < milestones.len(),
+            "Milestone index out of bounds"
+        );
+
+        let mut milestone = milestones.get(milestone_index).unwrap();
+        assert!(!milestone.attested, "Milestone already attested");
+
+        milestone.attested = true;
+        milestone.attested_at = env.ledger().timestamp();
+        milestones.set(milestone_index, milestone);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PerformanceMilestones(schedule_id), &milestones);
+
+        env.events().publish(
+            (symbol_short!("mile_att"), oracle),
+            (schedule_id, milestone_index),
+        );
+    }
+
+    /// Get performance milestones for a schedule.
+    pub fn get_milestones(env: Env, schedule_id: u64) -> Option<Vec<PerformanceMilestone>> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PerformanceMilestones(schedule_id))
+    }
+
+    /// Initialize the NFT contract for vesting receipt tokens.
+    ///
+    /// Can only be called once by the upgrade authority.
+    ///
+    /// # Errors
+    ///
+    /// Panics with `"NFT contract already initialized"` if called again.
+    pub fn initialize_nft_contract(env: Env, nft_contract: Address) {
+        let authority = Self::read_upgrade_authority(&env);
+        authority.require_auth();
+
+        assert!(
+            !env.storage().instance().has(&DataKey::NftContract),
+            "NFT contract already initialized"
+        );
+
+        env.storage()
+            .instance()
+            .set(&DataKey::NftContract, &nft_contract);
+        env.events()
+            .publish((symbol_short!("nft_init"), nft_contract), ());
+    }
+
+    /// Get the configured NFT contract address.
+    pub fn nft_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::NftContract)
+    }
+
     /// Claim all currently vested but unclaimed tokens.
     ///
     /// Vested-but-unclaimed tokens remain claimable even after a revocation.
@@ -622,6 +884,7 @@ impl VestFlowContract {
     ///
     /// Panics with `"Schedule not found"` if `schedule_id` does not exist.
     /// Panics with `"Nothing to claim yet"` if no tokens are currently claimable.
+    /// Panics with `"Performance milestones not met"` if milestones are required but not attested.
     pub fn claim(env: Env, schedule_id: u64) {
         Self::acquire_lock(&env);
 
@@ -634,7 +897,32 @@ impl VestFlowContract {
         schedule.beneficiary.require_auth();
 
         let now = env.ledger().timestamp();
-        let claimable = schedule.claimable_at(now);
+        let mut claimable = schedule.claimable_at(now);
+
+        // If performance milestones are required, limit claimable amount
+        if schedule.requires_milestones {
+            let milestones: Vec<PerformanceMilestone> = env
+                .storage()
+                .instance()
+                .get(&DataKey::PerformanceMilestones(schedule_id))
+                .unwrap_or(vec![&env]);
+
+            let mut max_unlock_percentage: u32 = 0;
+            for milestone in milestones.iter() {
+                if milestone.attested && milestone.unlock_percentage > max_unlock_percentage {
+                    max_unlock_percentage = milestone.unlock_percentage;
+                }
+            }
+
+            let max_claimable = (schedule.total_amount as i128)
+                .checked_mul(max_unlock_percentage as i128)
+                .and_then(|n| n.checked_div(100))
+                .unwrap_or(0)
+                - schedule.claimed;
+
+            claimable = claimable.min(max_claimable.max(0));
+        }
+
         assert!(claimable > 0, "Nothing to claim yet");
 
         schedule.claimed += claimable;
