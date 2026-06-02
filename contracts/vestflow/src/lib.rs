@@ -96,6 +96,26 @@ pub enum VestingKind {
     /// This models the most common real-world employee vesting schedule:
     /// a 1-year cliff followed by linear vesting over the remaining term.
     LinearWithCliff,
+    /// Tokens unlock at discrete milestones defined as (offset_seconds,
+    /// basis_points) pairs stored in `VestingSchedule::milestones`.
+    /// Each milestone unlocks `total_amount * bps / 10_000` tokens once
+    /// `start_time + offset_seconds` is reached.
+    Graded,
+}
+
+/// A single milestone for graded vesting.
+///
+/// `offset_secs` — seconds after `start_time` when this tranche unlocks.
+/// `bps`         — basis points (1/10_000) of `total_amount` that unlock.
+///
+/// The milestones in a schedule must sum to exactly 10_000 bps.
+#[contracttype]
+#[derive(Clone)]
+pub struct GradedMilestone {
+    /// Seconds after `start_time` when this tranche unlocks.
+    pub offset_secs: u64,
+    /// Basis points (out of 10_000) of `total_amount` that unlock.
+    pub bps: u32,
 }
 
 #[contracttype]
@@ -121,6 +141,7 @@ pub struct VestingSchedule {
     /// - `Linear`: ignored.
     /// - `Cliff`: tokens unlock all-at-once after this many seconds.
     /// - `LinearWithCliff`: no tokens until this point; linear from here to end.
+    /// - `Graded`: ignored (milestones define the schedule).
     pub cliff_duration: u64,
     pub kind: VestingKind,
     /// Whether the grantor can revoke unvested tokens.
@@ -131,6 +152,9 @@ pub struct VestingSchedule {
     /// Zero for non-revoked schedules. Used so the beneficiary can still
     /// claim already-vested tokens after a revocation.
     pub vested_at_revoke: i128,
+    /// Milestone tranches for `VestingKind::Graded` schedules.
+    /// Empty for all other kinds.
+    pub milestones: Vec<GradedMilestone>,
 }
 
 impl VestingSchedule {
@@ -188,6 +212,22 @@ impl VestingSchedule {
                     .checked_mul(linear_elapsed)
                     .and_then(|n| n.checked_div(linear_duration))
                     .unwrap_or(self.total_amount)
+            }
+            VestingKind::Graded => {
+                // Sum the bps of every milestone whose offset has been reached.
+                let mut vested_bps: u64 = 0;
+                for milestone in self.milestones.iter() {
+                    if elapsed >= milestone.offset_secs {
+                        vested_bps += milestone.bps as u64;
+                    }
+                }
+                // vested = total_amount * vested_bps / 10_000
+                // Use checked arithmetic; saturate to total_amount on overflow.
+                self.total_amount
+                    .checked_mul(vested_bps as i128)
+                    .and_then(|n| n.checked_div(10_000))
+                    .unwrap_or(self.total_amount)
+                    .min(self.total_amount)
             }
         }
     }
@@ -433,6 +473,110 @@ impl VestFlowContract {
             revocable,
             revoked: false,
             vested_at_revoke: 0,
+            milestones: vec![&env],
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Schedule(id), &schedule);
+        env.storage().instance().set(&DataKey::ScheduleCount, &id);
+
+        // Maintain grantor schedule index
+        let mut grantor_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::GrantorSchedules(grantor.clone()))
+            .unwrap_or(vec![&env]);
+        grantor_ids.push_back(id);
+        env.storage()
+            .instance()
+            .set(&DataKey::GrantorSchedules(grantor.clone()), &grantor_ids);
+
+        // Maintain beneficiary schedule index
+        let mut beneficiary_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::BeneficiarySchedules(beneficiary.clone()))
+            .unwrap_or(vec![&env]);
+        beneficiary_ids.push_back(id);
+        env.storage()
+            .instance()
+            .set(&DataKey::BeneficiarySchedules(beneficiary.clone()), &beneficiary_ids);
+
+        env.events().publish(
+            (symbol_short!("created"), grantor, beneficiary, token),
+            (id, total_amount),
+        );
+
+        id
+    }
+
+    /// Create a new graded (percentage-based) vesting schedule.
+    ///
+    /// Tokens unlock at discrete milestones. Each milestone specifies an
+    /// offset in seconds from `start_time` and a share in basis points
+    /// (1 bps = 0.01%). The milestones must sum to exactly 10 000 bps.
+    ///
+    /// Example: 10% at month 6, 20% at month 12, 70% at month 24 would use
+    /// milestones with offset_secs 15_552_000 / 31_104_000 / 62_208_000 and
+    /// bps 1_000 / 2_000 / 7_000 respectively.
+    ///
+    /// # Errors
+    ///
+    /// Panics with `"Amount must be positive"` if `total_amount` ≤ 0.
+    /// Panics with `"Milestones required"` if the milestones list is empty.
+    /// Panics with `"Milestones must sum to 10000 bps"` if the bps total ≠ 10 000.
+    pub fn create_graded_schedule(
+        env: Env,
+        grantor: Address,
+        beneficiary: Address,
+        token: Address,
+        total_amount: i128,
+        start_time: u64,
+        revocable: bool,
+        milestones: Vec<GradedMilestone>,
+    ) -> u64 {
+        grantor.require_auth();
+
+        assert!(beneficiary != grantor, "Beneficiary must differ from grantor");
+        assert!(total_amount > 0, "Amount must be positive");
+        assert!(!milestones.is_empty(), "Milestones required");
+
+        let total_bps: u64 = milestones.iter().map(|m| m.bps as u64).sum();
+        assert!(total_bps == 10_000, "Milestones must sum to 10000 bps");
+
+        // Derive duration from the last milestone offset so existing logic works.
+        let duration = milestones
+            .iter()
+            .map(|m| m.offset_secs)
+            .max()
+            .unwrap_or(0);
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ScheduleCount)
+            .unwrap_or(0);
+        let id = count + 1;
+
+        let contract_address = env.current_contract_address();
+        token::Client::new(&env, &token).transfer(&grantor, &contract_address, &total_amount);
+
+        let schedule = VestingSchedule {
+            id,
+            grantor: grantor.clone(),
+            beneficiary: beneficiary.clone(),
+            token: token.clone(),
+            total_amount,
+            claimed: 0,
+            start_time,
+            duration,
+            cliff_duration: 0,
+            kind: VestingKind::Graded,
+            revocable,
+            revoked: false,
+            vested_at_revoke: 0,
+            milestones,
         };
 
         env.storage()
@@ -1138,6 +1282,7 @@ mod test {
             revocable: false,
             revoked: false,
             vested_at_revoke: 0,
+            milestones: vec![&env],
         };
         // elapsed >> duration — must return exactly total_amount, not overflow
         assert_eq!(schedule.vested_at(u64::MAX), 1_000_000);
@@ -1164,6 +1309,7 @@ mod test {
             revocable: false,
             revoked: false,
             vested_at_revoke: 0,
+            milestones: vec![&env],
         };
         // elapsed = duration / 2 → would overflow without checked_mul
         let half_elapsed = u64::MAX / 2;
@@ -1193,6 +1339,7 @@ mod test {
             revocable: false,
             revoked: false,
             vested_at_revoke: 0,
+            milestones: vec![&env],
         };
         // Midpoint between cliff and end
         let mid = cliff + (duration - cliff) / 2;
@@ -1218,6 +1365,7 @@ mod test {
             revocable: false,
             revoked: false,
             vested_at_revoke: 0,
+            milestones: vec![&env],
         };
         assert_eq!(schedule.claimable_at(u64::MAX), 0);
     }
@@ -1241,6 +1389,7 @@ mod test {
             revocable: false,
             revoked: false,
             vested_at_revoke: 0,
+            milestones: vec![&env],
         };
         // Before end: 0 elapsed → 0 vested
         assert_eq!(schedule.vested_at(0), 0);
@@ -1300,6 +1449,101 @@ mod test {
         client.claim(&id);
         // Second claim at same timestamp — should panic
         client.claim(&id);
+    }
+
+    // --- Issue #65: graded vesting tests ---
+
+    #[test]
+    fn test_graded_vesting_milestones_unlock_at_correct_times() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, beneficiary, token_addr, _) = setup(&env);
+        let token = TokenClient::new(&env, &token_addr);
+
+        // 10% at t=600, 20% at t=1200, 70% at t=2400
+        set_time(&env, 0);
+        let milestones = soroban_sdk::vec![
+            &env,
+            GradedMilestone { offset_secs: 600,  bps: 1_000 },
+            GradedMilestone { offset_secs: 1200, bps: 2_000 },
+            GradedMilestone { offset_secs: 2400, bps: 7_000 },
+        ];
+        let id = client.create_graded_schedule(
+            &grantor,
+            &beneficiary,
+            &token_addr,
+            &10_000,
+            &0,
+            &false,
+            &milestones,
+        );
+
+        // Before first milestone: nothing
+        set_time(&env, 599);
+        assert_eq!(client.claimable(&id), 0);
+
+        // At first milestone: 10%
+        set_time(&env, 600);
+        assert_eq!(client.claimable(&id), 1_000);
+        client.claim(&id);
+        assert_eq!(token.balance(&beneficiary), 1_000);
+
+        // At second milestone: 20% more
+        set_time(&env, 1200);
+        assert_eq!(client.claimable(&id), 2_000);
+        client.claim(&id);
+        assert_eq!(token.balance(&beneficiary), 3_000);
+
+        // At final milestone: remaining 70%
+        set_time(&env, 2400);
+        assert_eq!(client.claimable(&id), 7_000);
+        client.claim(&id);
+        assert_eq!(token.balance(&beneficiary), 10_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Milestones must sum to 10000 bps")]
+    fn test_graded_vesting_rejects_invalid_bps_sum() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, beneficiary, token_addr, _) = setup(&env);
+
+        set_time(&env, 0);
+        // Only 9000 bps — should panic
+        let milestones = soroban_sdk::vec![
+            &env,
+            GradedMilestone { offset_secs: 600,  bps: 5_000 },
+            GradedMilestone { offset_secs: 1200, bps: 4_000 },
+        ];
+        client.create_graded_schedule(
+            &grantor,
+            &beneficiary,
+            &token_addr,
+            &10_000,
+            &0,
+            &false,
+            &milestones,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Milestones required")]
+    fn test_graded_vesting_rejects_empty_milestones() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, beneficiary, token_addr, _) = setup(&env);
+
+        set_time(&env, 0);
+        let milestones: soroban_sdk::Vec<GradedMilestone> = soroban_sdk::vec![&env];
+        client.create_graded_schedule(
+            &grantor,
+            &beneficiary,
+            &token_addr,
+            &10_000,
+            &0,
+            &false,
+            &milestones,
+        );
     }
 
     // --- Issue #7: transfer_beneficiary tests ---

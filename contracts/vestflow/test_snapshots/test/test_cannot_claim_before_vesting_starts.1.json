@@ -335,6 +335,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "milestones"
+                              },
+                              "val": {
+                                "vec": []
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "revocable"
                               },
                               "val": {

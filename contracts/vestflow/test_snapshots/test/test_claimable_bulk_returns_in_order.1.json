@@ -415,6 +415,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "milestones"
+                              },
+                              "val": {
+                                "vec": []
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "revocable"
                               },
                               "val": {
@@ -544,6 +552,14 @@
                                     "symbol": "Cliff"
                                   }
                                 ]
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "milestones"
+                              },
+                              "val": {
+                                "vec": []
                               }
                             },
                             {
