@@ -41,6 +41,7 @@ conti#![no_std]
 //! | `"No pending upgrade"` | Upgrade execution/cancellation attempted without an announcement |
 //! | `"Upgrade timelock still active"` | Upgrade execution attempted before 48 hours elapsed |
 //! | `"Upgrade executable time overflow"` | Upgrade announcement timestamp cannot safely add the timelock |
+//! | `"Insufficient balance or below minimum reserve"` | `claim` transfer fails due to balance constraints or Stellar minimum reserve |
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, vec, Address, BytesN, Env, Vec,
@@ -885,6 +886,7 @@ impl VestFlowContract {
     /// Panics with `"Schedule not found"` if `schedule_id` does not exist.
     /// Panics with `"Nothing to claim yet"` if no tokens are currently claimable.
     /// Panics with `"Performance milestones not met"` if milestones are required but not attested.
+    /// Panics with `"Insufficient balance or below minimum reserve"` if the transfer would violate balance constraints.
     pub fn claim(env: Env, schedule_id: u64) {
         Self::acquire_lock(&env);
 
@@ -928,11 +930,16 @@ impl VestFlowContract {
         schedule.claimed += claimable;
 
         let contract_address = env.current_contract_address();
-        token::Client::new(&env, &schedule.token).transfer(
-            &contract_address,
-            &schedule.beneficiary,
-            &claimable,
-        );
+        let token_client = token::Client::new(&env, &schedule.token);
+        
+        // Use try_transfer to catch balance-related errors and provide a clearer message
+        token_client
+            .try_transfer(
+                &contract_address,
+                &schedule.beneficiary,
+                &claimable,
+            )
+            .expect("Insufficient balance or below minimum reserve");
 
         env.storage()
             .instance()
